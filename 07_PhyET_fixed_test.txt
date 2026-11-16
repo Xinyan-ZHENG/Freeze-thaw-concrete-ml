@@ -1,0 +1,372 @@
+"""Refit the parameter and curve models with four explicitly held-out curves."""
+from pathlib import Path
+import os
+for variable in ['OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS']:
+    os.environ[variable] = '1'
+import hashlib
+import json
+import sys
+import time
+
+import joblib
+from joblib import Parallel, delayed
+import numpy as np
+import pandas as pd
+from sklearn.base import clone
+from sklearn.decomposition import PCA
+from sklearn.model_selection import GroupKFold, cross_val_predict
+
+ROOT = Path(__file__).resolve().parent
+OUT = ROOT / '07_PhyET_fixed_test_20261113'
+sys.path.insert(0, str(ROOT / 'modules'))
+import compare_ml_vs_physics_features as base
+import fit_alpha_beta_and_predict_physics_parameters as parameter_fit
+import model_selection as selection
+
+TARGETS = selection.TARGETS
+FEATURES = selection.FEATURES
+TEST_CURVES = ['A0-50', 'A1-150', 'A2-150', 'A2-250']
+POLICIES = ['RMSE', 'Log_MAE']
+TABLES = {}
+
+
+def save_table(name, frame):
+    TABLES[name] = frame
+    frame.to_csv(OUT / 'data' / f'{name}.csv', index=False, encoding='utf-8-sig')
+
+
+def load_sources():
+    raw = pd.read_excel(ROOT / 'data/Data organization.xlsx', sheet_name=0)
+    data = base.convert_excel_features(raw, 'Specimen', 'FT cycles(n)').rename(
+        columns={'Air-content': 'Initial air content'})
+    data['Specimen'] = data.Specimen.astype(str)
+    data['ConditionID'] = data.Specimen.str.split('-').str[0].astype(int)
+    en = parameter_fit.load_en_table(ROOT / 'data/En_reference.xlsx')
+    reference = en.set_index('Specimen')
+    data['CurveGroup'] = data.ConditionID.map(reference.CurveGroup)
+    data['CurveLabel'] = data.ConditionID.map(reference.CurveLabel)
+    data['En_MPa'] = data.ConditionID.map(reference.En_MPa)
+    np.testing.assert_allclose(data.FTC, data.ConditionID.map(reference.FT_cycles))
+    curves = {}
+    raw_curves = pd.read_excel(ROOT / 'data/Data organization.xlsx', sheet_name=1)
+    for j in range(0, raw_curves.shape[1], 2):
+        label = str(raw_curves.columns[j]).strip()
+        group, cycles = base.parse_curve_label(label)
+        points = raw_curves.iloc[:, j:j + 2].apply(pd.to_numeric, errors='coerce').dropna()
+        points.columns = ['Strain', 'Stress_MPa']
+        points.Strain *= .001
+        points = points.loc[points.Strain >= 0].groupby('Strain', as_index=False).Stress_MPa.max()
+        if points.Strain.iloc[0] > 0:
+            points = pd.concat([pd.DataFrame({'Strain': [0.], 'Stress_MPa': [0.]}), points], ignore_index=True)
+        curves[label] = base.CurveData(label, int(en.loc[en.CurveLabel.eq(label), 'Specimen'].iloc[0]),
+                                      group, cycles, points.Strain.to_numpy(), points.Stress_MPa.to_numpy())
+    fitted = []
+    for label, curve in curves.items():
+        en_value = float(en.loc[en.CurveLabel.eq(label), 'En_MPa'].iloc[0])
+        result = parameter_fit.fit_alpha_beta_fixed_en(curve, en_value)
+        assert result['fit_status'] == 'ok', (label, result['fit_status'])
+        fitted.append(dict(CurveLabel=label, En_MPa=en_value, **result))
+    fitted = pd.DataFrame(fitted)
+    for target in ['alpha', 'beta']:
+        data[target] = data.CurveLabel.map(fitted.set_index('CurveLabel')[target])
+    data['Curve_available'] = data.CurveLabel.isin(curves)
+    # Four additional groups preserve 8/39 held-out conditions without adding measured test curves.
+    unmeasured = sorted(set(data.CurveLabel) - set(curves))
+    additional = sorted(np.random.default_rng(42).choice(unmeasured, size=4, replace=False).tolist())
+    test_labels = TEST_CURVES + additional
+    data['Split'] = np.where(data.CurveLabel.isin(test_labels), 'Test', 'Train')
+    assert len(data) == 78 and data.ConditionID.nunique() == 39
+    assert data.groupby('ConditionID').size().eq(2).all()
+    assert data.groupby('ConditionID').Split.nunique().eq(1).all()
+    assert set(data.loc[data.Split.eq('Test') & data.Curve_available, 'CurveLabel']) == set(TEST_CURVES)
+    assert data.Split.value_counts().to_dict() == {'Train': 62, 'Test': 16}
+    for group, value in {'A0': 2.4, 'A1': 5.2, 'A2': 6.4}.items():
+        np.testing.assert_allclose(data.loc[data.CurveGroup.eq(group), 'Initial air content'], value)
+    save_table('Input_78', data)
+    save_table('Split_78', data[['Specimen', 'ConditionID', 'CurveLabel', 'Split', 'Curve_available']])
+    save_table('Fitted_parameters_21', fitted)
+    measured = pd.concat([pd.DataFrame({'CurveLabel': label, 'Strain': c.epsilon, 'Stress_MPa': c.sigma})
+                          for label, c in curves.items()], ignore_index=True)
+    save_table('Measured_curves_21', measured)
+    return data, curves, additional
+
+
+def choose_parameters(data, train, folds):
+    specs = selection.candidates()
+    ranking_rows = []
+    choices = []
+    models = {policy: {} for policy in POLICIES}
+    nested_models = {policy: {} for policy in POLICIES}
+    predictions = {policy: np.full((len(data), 3), np.nan) for policy in POLICIES}
+    nested = {policy: np.full((len(data), 3), np.nan) for policy in POLICIES}
+    x = data[FEATURES]
+    with Parallel(n_jobs=6, backend='loky') as parallel:
+        for j, target in enumerate(TARGETS):
+            valid = data[target].notna().to_numpy()
+            stages = [(0, train, np.arange(len(data)))]
+            stages.extend((fold, train[a], train[b]) for fold, (a, b) in enumerate(folds, 1))
+            for fold, training, validation in stages:
+                idx = training[valid[training]]
+                checkpoint = OUT / 'checkpoints' / f'{target}_fold{fold}.joblib'
+                if checkpoint.exists():
+                    ranking = joblib.load(checkpoint)
+                else:
+                    cv = list(GroupKFold(5 if fold == 0 else 4).split(
+                        x.iloc[idx], groups=data.loc[idx, 'ConditionID']))
+                    rows = parallel(delayed(selection.evaluate_candidate)(
+                        spec, x.iloc[idx], data.loc[idx, target].to_numpy(float),
+                        data.loc[idx, 'ConditionID'].to_numpy(), cv) for spec in specs)
+                    ranking = pd.DataFrame(rows)
+                    joblib.dump(ranking, checkpoint)
+                ranking_rows.append(ranking.assign(Target=target, Outer_fold=fold))
+                for policy in POLICIES:
+                    best = ranking.sort_values([policy, 'MAE', 'Key']).iloc[0]
+                    spec = next(s for s in specs if s['Key'] == best.Key)
+                    fitted = clone(spec['Model']).fit(x.iloc[idx], data.loc[idx, target])
+                    choice = {k: v for k, v in spec.items() if k != 'Model'}
+                    choices.append(dict(Policy=policy, Target=target, Outer_fold=fold,
+                                        **choice, CV_RMSE=best.RMSE, CV_Log_MAE=best.Log_MAE))
+                    if fold == 0:
+                        models[policy][target] = fitted
+                        predictions[policy][:, j] = selection.safe_predict(fitted, x)
+                    else:
+                        nested_models[policy][(fold, target)] = fitted
+                        nested[policy][validation, j] = selection.safe_predict(fitted, x.iloc[validation])
+                print(f'{target} outer fold {fold} completed', flush=True)
+    save_table('Training_CV_candidates', pd.concat(ranking_rows, ignore_index=True))
+    save_table('Model_selection', pd.DataFrame(choices))
+    return models, nested_models, predictions, nested
+
+
+def fit_curves(data, curves, training, auxiliary, oof):
+    idx = training[data.loc[training, 'Curve_available'].to_numpy(bool)]
+    max_eps = max(curves[data.loc[i, 'CurveLabel']].epsilon.max() for i in idx)
+    grid = np.linspace(0, max(.006, max_eps * 1.01), 180)
+    responses = np.vstack([base.interpolate_curve(curves[data.loc[i, 'CurveLabel']], grid) for i in idx])
+    pca = PCA(n_components=3, random_state=42).fit(responses)
+    scores = pca.transform(responses)
+    raw = data[FEATURES].to_numpy(float)
+    fitted = data[TARGETS].to_numpy(float)
+    curve_models = {'ET': clone(base.make_models(len(idx))['ET']).fit(raw[idx], scores)}
+    for policy in POLICIES:
+        for pathway, physical in [('fitted', fitted), ('crossfit', oof[policy])]:
+            name = f'{policy}_{pathway}'
+            x = np.column_stack([raw[idx], physical[idx]])
+            assert np.isfinite(x).all()
+            curve_models[name] = clone(base.make_models(len(idx))['ET']).fit(x, scores)
+    return dict(models=curve_models, grid=grid, pca=pca, training=idx)
+
+
+def predict_responses(data, artifact, auxiliary, idx, training=False, oof=None):
+    raw = data[FEATURES].to_numpy(float)
+    responses = {}
+    for name, model in artifact['models'].items():
+        if name == 'ET':
+            x = raw[idx]
+        else:
+            policy, pathway = name.rsplit('_', 1)
+            physical = auxiliary[policy][idx].copy()
+            if training:
+                measured = (data.loc[idx, 'Curve_available'] & data.loc[idx, 'Split'].eq('Train')).to_numpy(bool)
+                source = data[TARGETS].to_numpy(float) if pathway == 'fitted' else oof[policy]
+                physical[measured] = source[idx[measured]]
+            x = np.column_stack([raw[idx], physical])
+        responses[name] = np.maximum(artifact['pca'].inverse_transform(model.predict(x)), 0)
+    return responses
+
+
+def response_points(data, curves, artifact, responses, idx, split, fold):
+    rows = []
+    metrics = []
+    for name, values in responses.items():
+        for k, i in enumerate(idx):
+            if not data.loc[i, 'Curve_available']:
+                continue
+            curve = curves[data.loc[i, 'CurveLabel']]
+            yp = np.interp(curve.epsilon, artifact['grid'], values[k])
+            identity = dict(Model=name, Split=split, Fold=fold, Specimen=data.loc[i, 'Specimen'],
+                            CurveLabel=curve.label)
+            metrics.append(dict(**identity, **base.curve_metrics(curve.sigma, yp, curve.epsilon)))
+            rows.extend(dict(**identity, Strain=float(e), Reference_MPa=float(y), Predicted_MPa=float(p))
+                        for e, y, p in zip(curve.epsilon, curve.sigma, yp))
+    return rows, metrics
+
+
+def summarize(points, individual):
+    result = []
+    for (name, split), part in points.groupby(['Model', 'Split']):
+        averaged = part.groupby(['CurveLabel', 'Strain'])[['Reference_MPa', 'Predicted_MPa']].mean()
+        per = individual.loc[individual.Model.eq(name) & individual.Split.eq(split)]
+        result.append(dict(Model=name, Split=split, N_conditions=part.CurveLabel.nunique(),
+                           **selection.score(averaged.Reference_MPa, averaged.Predicted_MPa),
+                           Mean_curve_R2=per.R2.mean(),
+                           Peak_stress_error_pct=per.Peak_sigma_error_pct.mean(),
+                           Peak_strain_error_pct=per.Peak_epsilon_error_pct.mean()))
+    return pd.DataFrame(result)
+
+
+def parameter_results(data, train, test, prediction, nested, chosen):
+    rows = []
+    records = data[['Specimen', 'ConditionID', 'CurveLabel', 'Split', 'Curve_available']].copy()
+    for j, target in enumerate(TARGETS):
+        records[f'{target}_Reference'] = data[target]
+        records[f'{target}_Predicted'] = prediction[:, j]
+        records[f'{target}_Nested_CV'] = nested[:, j]
+        valid = data[target].notna().to_numpy()
+        for split, idx, values in [('Train', train[valid[train]], prediction),
+                                    ('Test', test[valid[test]], prediction),
+                                    ('Nested_train_CV', train[valid[train]], nested)]:
+            row = dict(Target=target, Model=chosen[target]['Family'], Split=split,
+                       N_records=len(idx), N_conditions=data.loc[idx, 'ConditionID'].nunique())
+            y = data.loc[idx, target].to_numpy(float)
+            rows.append(dict(**row, Level='Condition', **selection.condition_score(
+                y, values[idx, j], data.loc[idx, 'ConditionID'].to_numpy())))
+            rows.append(dict(**row, Level='Record', **selection.score(y, values[idx, j])))
+    save_table('Parameter_predictions_78', records)
+    metrics = pd.DataFrame(rows)
+    save_table('Parameter_metrics', metrics)
+    paper = metrics.loc[metrics.Level.eq('Condition')].copy()
+    paper['Error_unit'] = np.where(paper.Target.eq('En_MPa'), 'GPa',
+                                   np.where(paper.Target.eq('alpha'), 'strain', 'dimensionless'))
+    paper.loc[paper.Target.eq('En_MPa'), ['RMSE', 'MAE']] /= 1000
+    paper['Target'] = paper.Target.replace({'En_MPa': 'En', 'alpha': 'α', 'beta': 'β'})
+    save_table('Paper_parameter_metrics', paper.drop(columns='Level'))
+
+
+def propagation(data, curves, artifact, prediction, name, idx):
+    idx = idx[data.loc[idx, 'Curve_available'].to_numpy(bool)]
+    references = data.loc[idx, TARGETS].to_numpy(float)
+    estimates = prediction[idx]
+    scenarios = {'Predicted_all': estimates, 'Fitted_reference_all': references}
+    for j, target in enumerate(TARGETS):
+        values = estimates.copy()
+        values[:, j] = references[:, j]
+        scenarios[f'Fitted_reference_{target}'] = values
+    points = []
+    for scenario, parameters in scenarios.items():
+        x = np.column_stack([data.loc[idx, FEATURES].to_numpy(float), parameters])
+        response = np.maximum(artifact['pca'].inverse_transform(artifact['models'][name].predict(x)), 0)
+        for k, i in enumerate(idx):
+            curve = curves[data.loc[i, 'CurveLabel']]
+            physical = base.constitutive_sigma(curve.epsilon, *parameters[k])
+            learned = np.interp(curve.epsilon, artifact['grid'], response[k])
+            points.extend(dict(Scenario=scenario, Specimen=data.loc[i, 'Specimen'], CurveLabel=curve.label,
+                               Strain=float(e), Reference_MPa=float(y), PhyET=float(p), Constitutive=float(c))
+                          for e, y, p, c in zip(curve.epsilon, curve.sigma, learned, physical))
+    frame = pd.DataFrame(points)
+    results = []
+    for scenario, part in frame.groupby('Scenario'):
+        means = part.groupby(['CurveLabel', 'Strain'])[['Reference_MPa', 'PhyET', 'Constitutive']].mean()
+        for pathway in ['PhyET', 'Constitutive']:
+            results.append(dict(Scenario=scenario, Pathway=pathway,
+                                **selection.score(means.Reference_MPa, means[pathway])))
+    save_table('Error_propagation', pd.DataFrame(results))
+    save_table('Propagation_point_predictions', frame)
+
+
+def main():
+    started = time.time()
+    OUT.mkdir(exist_ok=True)
+    for name in ['data', 'checkpoints']:
+        (OUT / name).mkdir(exist_ok=True)
+    data, curves, additional = load_sources()
+    train = np.flatnonzero(data.Split.eq('Train'))
+    test = np.flatnonzero(data.Split.eq('Test'))
+    folds = list(GroupKFold(5).split(data.iloc[train], groups=data.loc[train, 'ConditionID']))
+    audit = []
+    for fold, (a, b) in enumerate(folds, 1):
+        for role, idx in [('Train', train[a]), ('Validation', train[b])]:
+            audit.extend(dict(Fold=fold, Role=role, Specimen=data.loc[i, 'Specimen'],
+                              ConditionID=data.loc[i, 'ConditionID'], CurveLabel=data.loc[i, 'CurveLabel']) for i in idx)
+    save_table('Validation_folds', pd.DataFrame(audit))
+    manifest = dict(test_curves=TEST_CURVES,
+                    sources={p.name: hashlib.sha256(p.read_bytes()).hexdigest()
+                             for p in (ROOT / 'data').glob('*.xlsx')},
+                    selection_code=hashlib.sha256((ROOT / 'modules' / 'model_selection.py').read_bytes()).hexdigest(),
+                    analysis_code=hashlib.sha256(Path(__file__).read_bytes()).hexdigest())
+    manifest_path = OUT / 'search_manifest.json'
+    if manifest_path.exists() and json.loads(manifest_path.read_text(encoding='utf-8')) != manifest:
+        for checkpoint in (OUT / 'checkpoints').glob('*.joblib'):
+            checkpoint.unlink()
+    manifest_path.write_text(json.dumps(manifest, indent=2), encoding='utf-8')
+    models, nested_models, predictions, nested = choose_parameters(data, train, folds)
+    cv_points = []
+    cv_individual = []
+    for fold, (a, b) in enumerate(folds, 1):
+        outer_train, outer_val = train[a], train[b]
+        inner_oof = {policy: np.full((len(data), 3), np.nan) for policy in POLICIES}
+        for policy in POLICIES:
+            for j, target in enumerate(TARGETS):
+                idx = outer_train[data.loc[outer_train, target].notna().to_numpy()]
+                template = nested_models[policy][(fold, target)]
+                values = cross_val_predict(clone(template), data.loc[idx, FEATURES], data.loc[idx, target],
+                                           groups=data.loc[idx, 'ConditionID'], cv=GroupKFold(4))
+                inner_oof[policy][idx, j] = np.maximum(np.asarray(values).reshape(-1), 1e-12)
+        artifact = fit_curves(data, curves, outer_train, nested, inner_oof)
+        responses = predict_responses(data, artifact, nested, outer_val)
+        rows, per = response_points(data, curves, artifact, responses, outer_val, 'Nested_training_CV', fold)
+        cv_points.extend(rows)
+        cv_individual.extend(per)
+    cv_points = pd.DataFrame(cv_points)
+    cv_individual = pd.DataFrame(cv_individual)
+    cv_metrics = summarize(cv_points, cv_individual)
+    save_table('Training_curve_selection', cv_metrics)
+    winner = cv_metrics.loc[cv_metrics.Model.ne('ET')].sort_values(['RMSE', 'Model']).iloc[0].Model
+    policy, pathway = winner.rsplit('_', 1)
+    selected = TABLES['Model_selection'].loc[TABLES['Model_selection'].Policy.eq(policy)
+                                            & TABLES['Model_selection'].Outer_fold.eq(0)]
+    chosen = {row.Target: row._asdict() for row in selected.itertuples(index=False)}
+    configuration = dict(test_curve_conditions=TEST_CURVES, additional_test_conditions=additional,
+                         train_records=62, test_records=16, train_conditions=31, test_conditions=8,
+                         train_curve_conditions=17, test_curve_count=4, seed=42,
+                         curve_variant=winner, auxiliary_loss=policy, training_pathway=pathway,
+                         decision_basis='Minimum training-partition grouped curve-validation RMSE across two auxiliary losses and two training pathways',
+                         auxiliary=chosen, features=FEATURES, target_order=TARGETS,
+                         holdout_status='User-specified four curve conditions; within-dataset evaluation after earlier exploratory analyses',
+                         input_hashes={p.name: hashlib.sha256(p.read_bytes()).hexdigest()
+                                       for p in (ROOT / 'data').glob('*.xlsx')})
+    (OUT / 'selected_configuration.json').write_text(json.dumps(configuration, ensure_ascii=False, indent=2), encoding='utf-8')
+    print(f'Training-only curve selection locked: {winner}', flush=True)
+    artifact = fit_curves(data, curves, train, predictions, nested)
+    response = predict_responses(data, artifact, predictions, np.arange(len(data)), training=True, oof=nested)
+    selected_response = {'ET': response['ET'], 'Phy-ET': response[winner]}
+    rows = []
+    per = []
+    for split, idx in [('Train', train), ('Test', test)]:
+        r, m = response_points(data, curves, artifact,
+                               {name: values[idx] for name, values in selected_response.items()}, idx, split, 0)
+        rows.extend(r)
+        per.extend(m)
+    points = pd.DataFrame(rows)
+    individual = pd.DataFrame(per)
+    selected_cv_points = cv_points.loc[cv_points.Model.isin(['ET', winner])].replace({'Model': {winner: 'Phy-ET'}})
+    selected_cv_per = cv_individual.loc[cv_individual.Model.isin(['ET', winner])].replace({'Model': {winner: 'Phy-ET'}})
+    save_table('ET_PhyET_metrics', summarize(pd.concat([points, selected_cv_points]),
+                                           pd.concat([individual, selected_cv_per])))
+    save_table('ET_PhyET_point_predictions', points)
+    save_table('Individual_curve_metrics', individual)
+    save_table('Curve_validation_points', selected_cv_points)
+    parameter_results(data, train, test, predictions[policy], nested[policy], chosen)
+    generated = []
+    for name, values in selected_response.items():
+        for i in range(len(data)):
+            generated.extend(dict(Model=name, Specimen=data.loc[i, 'Specimen'], CurveLabel=data.loc[i, 'CurveLabel'],
+                                  Split=data.loc[i, 'Split'], Strain=float(e), Stress_MPa=float(p))
+                             for e, p in zip(artifact['grid'], values[i]))
+    generated = pd.DataFrame(generated)
+    save_table('ET_PhyET_curves_78', generated)
+    for name, stem in [('ET', 'ET'), ('Phy-ET', 'PhyET')]:
+        save_table(f'{stem}_curves_78', generated.loc[generated.Model.eq(name)].drop(columns='Model'))
+    propagation(data, curves, artifact, predictions[policy], winner, test)
+    bundle = dict(auxiliary=models[policy], et_model=artifact['models']['ET'], curve_model=artifact['models'][winner],
+                  pca=artifact['pca'], grid=artifact['grid'], features=FEATURES, target_order=TARGETS,
+                  training_pathway=pathway, test_conditions=TEST_CURVES, physics_training=nested[policy])
+    joblib.dump(bundle, OUT / 'selected_models.joblib')
+    joblib.dump(dict(data=data, curves=curves, configuration=configuration), OUT / 'report_inputs.joblib')
+    print(TABLES['Paper_parameter_metrics'].to_string(index=False), flush=True)
+    print(TABLES['ET_PhyET_metrics'].to_string(index=False), flush=True)
+    print(f'Core analysis completed in {time.time() - started:.1f} seconds', flush=True)
+
+
+if __name__ == '__main__':
+    main()

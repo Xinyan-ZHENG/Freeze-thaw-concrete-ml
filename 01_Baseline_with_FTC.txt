@@ -1,0 +1,42 @@
+"""Single pair-grouped 80/20 baseline with FTC; numerical outputs only."""
+from pathlib import Path
+import sys
+ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(ROOT / 'modules'))
+import os, json
+import numpy as np
+import pandas as pd
+import joblib
+import baseline_core as m
+
+def main():
+    out = ROOT / '01_Baseline_with_FTC'
+    out.mkdir(exist_ok=True)
+    os.chdir(out)
+    m.EXCEL_PATH = ROOT / 'data' / 'Data organization.xlsx'
+    m.OUTPUT_DIR = out
+    # Match the original reported configuration: 30 trials and no GAN.
+    os.environ['ML_OPTUNA_TRIALS'] = '30'
+    for step in [m.data_loading, m.data_preprocessing, m.gan_augmentation,
+                 m.model_definition, m.hyperparameter_tuning, m.model_training,
+                 m.model_selection_summary]:
+        step()
+    m.state.four_model_metrics_df.to_csv(out/'main_metrics.csv', index=False, encoding='utf-8-sig')
+    rows = []
+    for target, models in m.state.best_models.items():
+        for name, model in models.items():
+            for split, x, y in [('train', m.state.X_train_scaled, m.state.y_train),
+                                 ('test', m.state.X_test_scaled, m.state.y_test)]:
+                prediction = m._predict_1d(model, x)
+                for i, pred in zip(y.index, prediction):
+                    rows.append(dict(Target=target, Model=m._display_model_name(name), Split=split,
+                                     Specimen=m.state.df.loc[i,m.state.id_col], Actual=float(y.loc[i,target]),
+                                     Predicted=float(pred)))
+    pd.DataFrame(rows).to_csv(out/'predictions.csv', index=False, encoding='utf-8-sig')
+    (out/'selected_parameters.json').write_text(json.dumps(m.state.optimization_results, indent=2), encoding='utf-8')
+    joblib.dump(dict(models=m.state.best_models, scaler=m.state.scaler_robust,
+                     features=m.state.feature_cols), out/'fitted_models.joblib')
+    print(m.state.four_model_metrics_df.to_string(index=False))
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,8 @@
+"""03_LOCO_with_FTC: grouped validation without plotting."""
+from pathlib import Path
+import sys
+ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(ROOT / 'modules'))
+from validation_runner import validation
+if __name__ == '__main__':
+    validation('LOCO')

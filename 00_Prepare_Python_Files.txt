@@ -1,0 +1,17 @@
+"""Run with Python to create runnable .py copies from the distributed TXT sources."""
+from pathlib import Path
+import shutil
+ROOT = Path(__file__).resolve().parent
+FILES = ['01_Baseline_with_FTC.txt', '02_Random10_with_FTC.txt', '03_LOCO_with_FTC.txt', '07_PhyET_fixed_test_20261113.txt', 'modules/baseline_core.txt', 'modules/compare_ml_vs_physics_features.txt', 'modules/fit_alpha_beta_and_predict_physics_parameters.txt', 'modules/model_selection.txt', 'modules/validation_core.txt', 'modules/validation_report.txt', 'modules/validation_runner.txt']
+def main():
+    target = ROOT/'runnable'
+    target.mkdir(exist_ok=True)
+    for name in FILES:
+        source = ROOT/name
+        dest = (target/name).with_suffix('.py')
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(source.read_text(encoding='utf-8-sig'), encoding='utf-8')
+    shutil.copytree(ROOT/'data', target/'data', dirs_exist_ok=True)
+    print('Python sources prepared in:', target)
+if __name__ == '__main__':
+    main()
